@@ -1,0 +1,46 @@
+name: Build zh-Hant
+
+on:
+  push:
+    branches: [feat/zh-hant-locale]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'website/**'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        binary:
+          - name: deepseek
+            artifact: deepseek-linux-x64
+          - name: deepseek-tui
+            artifact: deepseek-tui-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libdbus-1-dev pkg-config
+
+      - name: Build ${{ matrix.binary.name }}
+        run: cargo build --release --locked --bin ${{ matrix.binary.name }}
+
+      - name: Rename artifact
+        run: cp target/release/${{ matrix.binary.name }} ${{ matrix.binary.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary.artifact }}
+          path: ${{ matrix.binary.artifact }}
