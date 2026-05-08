@@ -135,6 +135,10 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub env: HashMap<String, String>,
     pub url: Option<String>,
+    /// Transport protocol: `"sse"` (legacy, default) or `"streamable-http"`.
+    /// Only meaningful when `url` is set.
+    #[serde(default = "default_transport")]
+    pub transport: String,
     #[serde(default)]
     pub connect_timeout: Option<u64>,
     #[serde(default)]
@@ -151,6 +155,10 @@ pub struct McpServerConfig {
     pub enabled_tools: Vec<String>,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+}
+
+fn default_transport() -> String {
+    "sse".to_string()
 }
 
 fn default_enabled() -> bool {
@@ -582,6 +590,162 @@ impl McpTransport for SseTransport {
 
 // === McpConnection - Async Connection Management ===
 
+// === StreamableHttpTransport ===
+
+/// StreamableHTTP transport for MCP servers (2025 spec).
+///
+/// Unlike the older SSE transport (GET + endpoint discovery), this transport
+/// uses plain POST JSON-RPC to the server URL. The server responds with an
+/// `mcp-session-id` header on the first meaningful exchange, and subsequent
+/// requests must include that header. Responses may be plain JSON or
+/// SSE-formatted; this transport handles both.
+pub struct StreamableHttpTransport {
+    client: reqwest::Client,
+    url: String,
+    session_id: Option<String>,
+    /// Buffered SSE lines not yet assembled into a complete event.
+    sse_buffer: String,
+    /// Parsed JSON values waiting to be consumed by `recv()`.
+    pending_messages: VecDeque<serde_json::Value>,
+}
+
+impl StreamableHttpTransport {
+    pub async fn connect(
+        client: reqwest::Client,
+        url: String,
+        _connect_timeout: Duration,
+    ) -> Result<Self> {
+        let mut transport = Self {
+            client,
+            url,
+            session_id: None,
+            sse_buffer: String::new(),
+            pending_messages: VecDeque::new(),
+        };
+
+        // Pre-flight with a minimal notification to surface connectivity
+        // errors early.  Some servers reject unadvertised notifications
+        // with 405; that's non-fatal.
+        let response = transport
+            .post_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/init",
+                "params": {}
+            }))
+            .await;
+        match response {
+            Ok(resp) => {
+                transport.extract_session_id(&resp);
+                let body_bytes = resp.bytes().await.unwrap_or_default();
+                transport.feed_sse(&String::from_utf8_lossy(&body_bytes));
+            }
+            Err(e) => {
+                if e.to_string().contains("connect")
+                    || e.to_string().contains("refused")
+                    || e.to_string().contains("timeout")
+                {
+                    return Err(e);
+                }
+                tracing::debug!(
+                    "StreamableHTTP pre-flight for {} returned non-fatal: {e}",
+                    mask_url_secrets(&transport.url),
+                );
+            }
+        }
+
+        Ok(transport)
+    }
+
+    async fn post_json_rpc(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
+        let mut req = self
+            .client
+            .post(&self.url)
+            .json(body)
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(ref sid) = self.session_id {
+            req = req.header("mcp-session-id", sid.as_str());
+        }
+        let response = req.send().await.with_context(|| {
+            format!(
+                "StreamableHTTP POST failed (url={})",
+                mask_url_secrets(&self.url),
+            )
+        })?;
+        Ok(response)
+    }
+
+    fn extract_session_id(&mut self, response: &reqwest::Response) {
+        if let Some(sid) = response.headers().get("mcp-session-id") {
+            if let Ok(value) = sid.to_str() {
+                self.session_id = Some(value.to_string());
+            }
+        }
+    }
+
+    /// Feed raw bytes (potentially containing SSE events) into the pending
+    /// message queue.  Plain JSON responses are parsed directly.
+    fn feed_sse(&mut self, raw: &str) {
+        self.sse_buffer.push_str(raw);
+
+        // Try plain JSON first.
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(self.sse_buffer.trim()) {
+            self.pending_messages.push_back(val);
+            self.sse_buffer.clear();
+            return;
+        }
+
+        // SSE parsing
+        while let Some(pos) = self.sse_buffer.find("\n\n") {
+            let event_block = self.sse_buffer[..pos].to_string();
+            self.sse_buffer = self.sse_buffer[pos + 2..].to_string();
+
+            let mut data = String::new();
+            for line in event_block.lines() {
+                if let Some(stripped) = line.strip_prefix("data: ") {
+                    data.push_str(stripped);
+                }
+            }
+            if data.is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                self.pending_messages.push_back(val);
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl McpTransport for StreamableHttpTransport {
+    async fn send(&mut self, msg: serde_json::Value) -> Result<()> {
+        let response = self.post_json_rpc(&msg).await?;
+        let status = response.status();
+        self.extract_session_id(&response);
+
+        let body_bytes = response.bytes().await.unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "StreamableHTTP POST rejected (url={} status={}): {}",
+                mask_url_secrets(&self.url),
+                status,
+                redact_body_preview(&body_text),
+            );
+        }
+
+        self.feed_sse(&body_text);
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<serde_json::Value> {
+        self.pending_messages
+            .pop_front()
+            .context("StreamableHTTP transport closed — no pending messages")
+    }
+}
+
+
 /// Manages a single async connection to an MCP server
 pub struct McpConnection {
     name: String,
@@ -636,15 +800,26 @@ impl McpConnection {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(connect_timeout_secs))
                 .build()?;
-            Box::new(
-                SseTransport::connect(
-                    client,
-                    url.clone(),
-                    cancel_token.clone(),
-                    Duration::from_secs(connect_timeout_secs),
+            if config.transport == "streamable-http" {
+                Box::new(
+                    StreamableHttpTransport::connect(
+                        client,
+                        url.clone(),
+                        Duration::from_secs(connect_timeout_secs),
+                    )
+                    .await?,
                 )
-                .await?,
-            )
+            } else {
+                Box::new(
+                    SseTransport::connect(
+                        client,
+                        url.clone(),
+                        cancel_token.clone(),
+                        Duration::from_secs(connect_timeout_secs),
+                    )
+                    .await?,
+                )
+            }
         } else if let Some(command) = &config.command {
             let mut cmd = tokio::process::Command::new(command);
             cmd.args(&config.args)
@@ -1635,6 +1810,7 @@ fn mcp_template_json() -> Result<String> {
             args: vec!["./path/to/your-mcp-server.js".to_string()],
             env: HashMap::new(),
             url: None,
+            transport: "sse".to_string(),
             connect_timeout: None,
             execute_timeout: None,
             read_timeout: None,
@@ -1686,6 +1862,7 @@ pub fn add_server_config(
             args,
             env: HashMap::new(),
             url,
+            transport: "sse".to_string(),
             connect_timeout: None,
             execute_timeout: None,
             read_timeout: None,
@@ -1768,7 +1945,9 @@ fn snapshot_from_config(
         .servers
         .iter()
         .map(|(name, server)| {
-            let transport = if server.url.is_some() {
+            let transport = if server.transport == "streamable-http" {
+                "streamable-http"
+            } else if server.url.is_some() {
                 "http/sse"
             } else {
                 "stdio"
