@@ -1530,6 +1530,7 @@ fn chinese_traditional(id: MessageId) -> Option<&'static str> {
         MessageId::HelpFooterJump => " PgUp/PgDn 跳轉 ",
         MessageId::HelpFooterClose => " Esc 關閉 ",
         MessageId::CmdAgentDescription => "切換到 Agent 模式",
+        MessageId::CmdAnchorDescription => "釘選關鍵事實，在壓縮後自動注入上下文",
         MessageId::CmdAttachDescription => "附加圖片或影片媒體；文字檔或目錄請使用 @path",
         MessageId::CmdCacheDescription => "顯示最近 N 輪的 DeepSeek 前綴快取命中/未命中統計",
         MessageId::CmdClearDescription => "清除對話歷史",
@@ -1560,11 +1561,14 @@ fn chinese_traditional(id: MessageId) -> Option<&'static str> {
         MessageId::CmdMemoryDescription => "查看或管理持久使用者記憶檔案",
         MessageId::CmdModelDescription => "切換或查看目前模型",
         MessageId::CmdModelsDescription => "列出 API 中可用的模型",
+        MessageId::CmdNetworkDescription => "管理網路允許與拒絕規則",
         MessageId::CmdNoteDescription => "將筆記追加到持久筆記檔案（.deepseek/notes.md）",
         MessageId::CmdPlanDescription => "切換到 Plan 模式並查看建議的實作步驟",
+        MessageId::CmdThemeDescription => "切換深色與淺色主題",
         MessageId::CmdProviderDescription => "切換或查看目前 LLM 後端（deepseek | nvidia-nim）",
         MessageId::CmdQueueDescription => "查看或編輯已排隊的訊息",
         MessageId::CmdRecallDescription => "搜尋先前的循環封存（基於訊息文字的 BM25 檢索）",
+        MessageId::CmdRenameDescription => "重新命名目前工作階段",
         MessageId::CmdRestoreDescription => {
             "將工作區回復到先前輪次前/後的快照。不帶參數時列出最近的快照。"
         }
